@@ -5,83 +5,91 @@ description: Run tests via tmux by sending commands to a pane and capturing outp
 
 # tmux-test
 
-Run test commands inside an existing tmux pane using `send-keys`, then capture the output with `capture-pane`.
+Run test commands inside an existing tmux pane using `send-keys`, then capture output with `capture-pane`.
+
+## Key facts (verified by testing)
+
+- Pane indices start at **1**, not 0 (e.g. `skill-test:1.1`, not `skill-test:0.0`)
+- `capture-pane -p` pads output to the full terminal height with blank lines — always strip them before processing
+- `$?` in a `send-keys` argument **expands in the calling shell**, not tmux — use single quotes to pass it literally
 
 ## Workflow
 
-### 1. Find the target pane
-
-List available sessions, windows, and panes to identify where to run the tests:
+### 1. Discover the target pane
 
 ```bash
 tmux list-sessions
-tmux list-windows -t <session>
-tmux list-panes -t <session>:<window>
+tmux list-panes -t <session> -F "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}"
 ```
 
-Use the format `<session>:<window>.<pane>` as the target (e.g. `main:0.0`). If the user has not specified a target, pick the most recently active pane or ask.
+Target format: `<session>:<window>.<pane>` — e.g. `main:1.1`
+
+If the user has not specified a target, pick the most recently active pane or ask.
 
 ### 2. Send the test command
 
 ```bash
-tmux send-keys -t <target-pane> "<test-command>" Enter
+tmux send-keys -t <target> "<test-command>" Enter
 ```
 
-- Use `-l` for literal strings containing special characters to avoid key-name lookup:
-  ```bash
-  tmux send-keys -t <target-pane> -l "<test-command>"
-  tmux send-keys -t <target-pane> Enter
-  ```
-- To send `Ctrl+C` to cancel a running process: `tmux send-keys -t <target-pane> C-c`
-- To clear the pane first: `tmux send-keys -t <target-pane> "clear" Enter`
-
-### 3. Wait for completion
-
-Poll with `capture-pane` until the shell prompt reappears or output stabilizes:
+For commands containing special characters, send in two steps using `-l` (literal, disables key-name lookup):
 
 ```bash
-sleep 2
+tmux send-keys -t <target> -l "<test-command>"
+tmux send-keys -t <target> Enter
 ```
 
-For slow test suites, poll in a loop checking for the prompt string (e.g. `$`, `%`, `>`).
+Other useful key sends:
+- Cancel a running process: `tmux send-keys -t <target> C-c`
+- Clear the pane: `tmux send-keys -t <target> "clear" Enter`
+
+### 3. Wait for completion — poll for the shell prompt
+
+`capture-pane` pads output with blank lines to fill the terminal height. Strip them, then check the last real line for a shell prompt:
+
+```bash
+for i in $(seq 1 30); do
+  sleep 0.5
+  last=$(tmux capture-pane -t <target> -p | sed '/^[[:space:]]*$/d' | tail -1)
+  if echo "$last" | grep -qE '%\s*$|\$\s*$|#\s*$|>\s*$'; then
+    break
+  fi
+done
+```
+
+For fast tests a single `sleep 1` is sufficient. For slow suites use the polling loop.
 
 ### 4. Capture the output
 
 ```bash
-tmux capture-pane -t <target-pane> -p
+tmux capture-pane -t <target> -p | sed '/^[[:space:]]*$/d'
 ```
 
 Key flags:
-- `-p` — print to stdout instead of a buffer
-- `-S <line>` — start line (negative = history lines back; `-S -` = full history)
-- `-E <line>` — end line (`-E -` = end of visible pane)
-- `-e` — include escape sequences (colors/attributes)
-- `-J` — join wrapped lines and preserve trailing spaces (useful for wide output)
+- `-p` — print to stdout
+- `-S -` — include full scrollback history (e.g. `tmux capture-pane -t <target> -p -S -`)
+- `-E -` — capture to end of visible pane
+- `-e` — include ANSI escape sequences (color)
+- `-J` — join wrapped lines, preserve trailing spaces
 
-To capture full scrollback history:
+### 5. Get the exit code
+
+**Always use single quotes** so `$?` is not expanded by the calling shell:
 
 ```bash
-tmux capture-pane -t <target-pane> -p -S -
+tmux send-keys -t <target> 'echo EXIT:$?' Enter
+sleep 0.3
+tmux capture-pane -t <target> -p | sed '/^[[:space:]]*$/d' | grep 'EXIT:' | tail -1
 ```
 
-### 5. Interpret results
-
-- Look for test framework summaries (PASSED/FAILED/ERROR counts) and shell prompt return.
-- To get the exit code of the last command run in the pane:
-  ```bash
-  tmux send-keys -t <target-pane> "echo $?" Enter
-  sleep 0.5
-  tmux capture-pane -t <target-pane> -p
-  ```
-
-## Detecting the test framework
+## Detect the test framework
 
 Check files in the working directory before choosing a command:
 
 | File present | Framework | Command |
 |---|---|---|
-| `pytest.ini`, `pyproject.toml`, `setup.cfg` | pytest | `pytest` or `pytest -v` |
-| `package.json` (jest in deps) | Jest | `npm test` or `npx jest` |
+| `pytest.ini`, `pyproject.toml`, `setup.cfg` | pytest | `pytest -v` |
+| `package.json` (jest in deps) | Jest | `npm test` |
 | `Gemfile` | RSpec | `bundle exec rspec` |
 | `go.mod` | Go test | `go test ./...` |
 | `Cargo.toml` | Cargo | `cargo test` |
@@ -91,6 +99,6 @@ Check files in the working directory before choosing a command:
 
 ## Notes
 
-- Always confirm the correct pane target before sending keys — sending to the wrong pane can interrupt other work.
-- If no tmux session exists, inform the user rather than creating one silently.
-- Avoid hardcoding session names; discover them with `tmux list-sessions` first.
+- Always confirm the correct pane target before sending keys — wrong pane can interrupt other work.
+- If no tmux session exists, inform the user; do not silently create one.
+- Avoid hardcoding session names; always discover with `tmux list-sessions` first.
